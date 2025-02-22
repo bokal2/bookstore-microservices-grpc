@@ -1,8 +1,11 @@
 # recommendations/recommendations.py
 from concurrent import futures
 import random
+from signal import signal, SIGTERM
 
 import grpc
+from grpc_interceptor import ExceptionToStatusInterceptor
+from grpc_interceptor.exceptions import NotFound
 
 from recommendations_pb2 import (
     BookCategory,
@@ -33,7 +36,7 @@ books_by_category = {
 class RecommendationService(recommendations_pb2_grpc.RecommendationsServicer):
     def Recommend(self, request, context):
         if request.category not in books_by_category:
-            context.abort(grpc.StatusCode.NOT_FOUND, "Category not found")
+            raise NotFound("Category not found!")
 
         books_for_category = books_by_category[request.category]
         num_results = min(request.max_results, len(books_for_category))
@@ -43,12 +46,37 @@ class RecommendationService(recommendations_pb2_grpc.RecommendationsServicer):
 
 
 def serve():
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    interceptors = [ExceptionToStatusInterceptor()]
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=10), interceptors=interceptors
+    )
     recommendations_pb2_grpc.add_RecommendationsServicer_to_server(
         RecommendationService(), server
     )
-    server.add_insecure_port("[::]:50051")
+
+    with open("server.key", "rb") as fp:
+        server_key = fp.read()
+    with open("server.pem", "rb") as fp:
+        server_cert = fp.read()
+    with open("ca.pem", "rb") as fp:
+        ca_cert = fp.read()
+
+    creds = grpc.ssl_server_credentials(
+        [(server_key, server_cert)],
+        root_certificates=ca_cert,
+        require_client_auth=True,
+    )
+
+    server.add_secure_port("[::]:50051", creds)
     server.start()
+
+    def handle_sigterm(*_):
+        print("Received shutdown signal")
+        all_rpcs_done_event = server.stop(30)
+        all_rpcs_done_event.wait(30)
+        print("Shut down gracefully")
+
+    signal(SIGTERM, handle_sigterm)
     server.wait_for_termination()
 
 
